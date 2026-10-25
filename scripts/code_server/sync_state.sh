@@ -25,6 +25,8 @@ TARGETS_TO_PACK=()
 [ -d "$WORKSPACE_DIR" ] && TARGETS_TO_PACK+=("workspace")
 [ -d "$CLAUDE_DIR" ] && TARGETS_TO_PACK+=(".claude")
 [ -f "/home/runner/.claude.json" ] && TARGETS_TO_PACK+=(".claude.json")
+[ -d "/home/runner/.hermes" ] && TARGETS_TO_PACK+=(".hermes")
+[ -d "/home/runner/.suwayomi_state" ] && TARGETS_TO_PACK+=(".suwayomi_state")
 [ -d "$CONFIG_DIR" ] && TARGETS_TO_PACK+=(".config/code-server")
 [ -d "/home/runner/.local/share/code-server" ] && TARGETS_TO_PACK+=(".local/share/code-server")
 
