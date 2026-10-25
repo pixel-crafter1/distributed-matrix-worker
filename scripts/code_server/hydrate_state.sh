@@ -90,7 +90,49 @@ if [ "$CODE_SERVER_ARCHIVE_VALID" != "true" ] && (rclone ls "$LEGACY_VOLUMES_TAR
   rm -rf "$MIGRATE_TEMP"
 fi
 
-# 3. Ensure permissions and directories are clean
+# 3. Bridge Claude memory paths if migrating across workspace roots (-config-workspace vs -home-runner-workspace)
+if [ -d "$CLAUDE_DIR/projects/-config-workspace/memory" ] && [ ! -d "$CLAUDE_DIR/projects/-home-runner-workspace/memory" ]; then
+  echo "[HYDRATE] Bridging Claude persistent memories to -home-runner-workspace..."
+  mkdir -p "$CLAUDE_DIR/projects/-home-runner-workspace"
+  cp -rn "$CLAUDE_DIR/projects/-config-workspace/memory" "$CLAUDE_DIR/projects/-home-runner-workspace/"
+fi
+
+# 4. Ensure permissions and directories are clean
 sudo chown -R runner:docker "$WORKSPACE_DIR" "$CLAUDE_DIR" /home/runner/.config /home/runner/.local 2>/dev/null || true
+[ -f "/home/runner/.claude.json" ] && sudo chown runner:docker /home/runner/.claude.json 2>/dev/null || true
 RESTORED_COUNT=$(find "$WORKSPACE_DIR" -mindepth 1 2>/dev/null | wc -l || echo 0)
 echo "[HYDRATE] Hydration complete. $RESTORED_COUNT files available in $WORKSPACE_DIR."
+
+# 5. Compatibility Bridge: Set up /config directory & runtime environments
+sudo mkdir -p /config
+sudo chown -R runner:docker /config
+ln -sfn "$WORKSPACE_DIR" /config/workspace
+ln -sf "$WORKSPACE_DIR"/start*.sh /config/ 2>/dev/null || true
+
+# If hermes-venv or .local are missing from /config, extract them from archive
+if [ ! -d "/config/hermes-venv" ]; then
+  if [ ! -f "$STAGE_DIR/volumes_bundle.tar.gz" ] && (rclone ls "$LEGACY_VOLUMES_TARGET" >/dev/null 2>&1); then
+    echo "[HYDRATE] Downloading runtime bundle from $LEGACY_VOLUMES_TARGET..."
+    rclone copyto "$LEGACY_VOLUMES_TARGET" "$STAGE_DIR/volumes_bundle.tar.gz" \
+      --drive-chunk-size=256M --buffer-size=64M --retries=5 --timeout=3m
+  fi
+  if [ -f "$STAGE_DIR/volumes_bundle.tar.gz" ]; then
+    echo "[HYDRATE] Restoring /config/hermes-venv, .hermes, and .local from volume archive..."
+    tar -zxf "$STAGE_DIR/volumes_bundle.tar.gz" \
+      --strip-components=2 \
+      -C /config \
+      ./o7fnohdje503ojdahkkscdqi_code-server-config/_data/hermes-venv \
+      ./o7fnohdje503ojdahkkscdqi_code-server-config/_data/.hermes \
+      ./o7fnohdje503ojdahkkscdqi_code-server-config/_data/.local 2>/dev/null || true
+    if [ -d "/config/_data" ]; then
+      cp -rn /config/_data/. /config/ 2>/dev/null || true
+      rm -rf /config/_data
+    fi
+  fi
+fi
+
+# 6. Headless Autostart of background services (no browser connection needed)
+if [ -x "$WORKSPACE_DIR/start-all-services.sh" ]; then
+  echo "[HYDRATE] Headless autostart: launching all background services..."
+  nohup bash "$WORKSPACE_DIR/start-all-services.sh" > /tmp/start-all-services.log 2>&1 &
+fi
