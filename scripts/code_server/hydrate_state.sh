@@ -104,9 +104,11 @@ RESTORED_COUNT=$(find "$WORKSPACE_DIR" -mindepth 1 2>/dev/null | wc -l || echo 0
 echo "[HYDRATE] Hydration complete. $RESTORED_COUNT files available in $WORKSPACE_DIR."
 
 # 5. Compatibility Bridge: Set up /config directory & runtime environments
-sudo mkdir -p /config
-sudo chown -R runner:docker /config
+sudo mkdir -p /config /home/runner/.hermes /home/runner/.suwayomi_state
+sudo chown -R runner:docker /config /home/runner/.hermes /home/runner/.suwayomi_state
 ln -sfn "$WORKSPACE_DIR" /config/workspace
+ln -sfn /home/runner/.hermes /config/.hermes
+ln -sfn /home/runner/.suwayomi_state /config/suwayomi_state
 ln -sf "$WORKSPACE_DIR"/start*.sh /config/ 2>/dev/null || true
 
 # If hermes-venv or .local are missing from /config, extract them from archive
@@ -117,22 +119,18 @@ if [ ! -d "/config/hermes-venv" ]; then
       --drive-chunk-size=256M --buffer-size=64M --retries=5 --timeout=3m
   fi
   if [ -f "$STAGE_DIR/volumes_bundle.tar.gz" ]; then
-    echo "[HYDRATE] Restoring /config/hermes-venv, .hermes, and .local from volume archive..."
+    echo "[HYDRATE] Restoring /config/hermes-venv and .local from volume archive..."
     tar -zxf "$STAGE_DIR/volumes_bundle.tar.gz" \
-      --strip-components=2 \
+      --strip-components=3 \
       -C /config \
       ./o7fnohdje503ojdahkkscdqi_code-server-config/_data/hermes-venv \
-      ./o7fnohdje503ojdahkkscdqi_code-server-config/_data/.hermes \
       ./o7fnohdje503ojdahkkscdqi_code-server-config/_data/.local 2>/dev/null || true
-    if [ -d "/config/_data" ]; then
-      cp -rn /config/_data/. /config/ 2>/dev/null || true
-      rm -rf /config/_data
+    # Seed /home/runner/.hermes from legacy volume only if not already restored from code_server_bundle
+    if [ ! -f "/home/runner/.hermes/config.yaml" ]; then
+      tar -zxf "$STAGE_DIR/volumes_bundle.tar.gz" \
+        --strip-components=3 \
+        -C /home/runner \
+        ./o7fnohdje503ojdahkkscdqi_code-server-config/_data/.hermes 2>/dev/null || true
     fi
   fi
-fi
-
-# 6. Headless Autostart of background services (no browser connection needed)
-if [ -x "$WORKSPACE_DIR/start-all-services.sh" ]; then
-  echo "[HYDRATE] Headless autostart: launching all background services..."
-  nohup bash "$WORKSPACE_DIR/start-all-services.sh" > /tmp/start-all-services.log 2>&1 &
 fi
