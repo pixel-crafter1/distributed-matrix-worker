@@ -116,7 +116,7 @@ jobs:
             -subj "/CN=code.silver-xf.bond" 2>/dev/null
 
           # Install lightweight nginx to bridge both Port 80 (HTTP) and Port 443 (HTTPS) to code-server (8080)
-          sudo apt-get install -y -qq nginx 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq nginx 2>/dev/null || true
           sudo cat << 'EOF' | sed "s/^[[:space:]]*//" | sudo tee /etc/nginx/sites-available/default >/dev/null
           server {
               listen 80 default_server;
@@ -187,6 +187,12 @@ jobs:
               cat /tmp/metrics-agent.log || true
               exit 1
             fi
+          fi
+
+          # Launch all persistent background services headlessly after code-server & ingress are online
+          if [ -x /home/runner/workspace/start-all-services.sh ]; then
+            echo "Launching background services via start-all-services.sh..."
+            nohup bash /home/runner/workspace/start-all-services.sh > /tmp/start-all-services.log 2>&1 &
           fi
 
           # Telegram Alert: Node is active
@@ -263,7 +269,12 @@ jobs:
             # Trigger successor handover 15 minutes before retirement
             if [ $ELAPSED_MIN -ge $HANDOVER_MINUTE ] && [ "$HANDOVER_TRIGGERED" != "true" ]; then
               echo "=== PREPARING CLEAN ZERO-DOWNTIME SUCCESSOR HANDOVER ==="
+              echo "[HANDOVER] Stopping background bots cleanly before state snapshot to prevent 409 conflicts..."
+              pkill -SIGTERM -f "hermes gateway|Telegram_S3_Gateway_Bot|Stream_Vault|code_server_bot|forwarder_bot|telegram_deal_listener|motion_reader_server|batch_engine|Suwayomi-Server|cai_tts_bundle" 2>/dev/null || true
+              sleep 3
+
               ./scripts/code_server/sync_state.sh "$TARGET"
+              touch /tmp/handover_synced
 
               if [ $CURRENT_INDEX -ge 0 ] && [ -n "$NEXT_PAT" ]; then
                 NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
@@ -282,12 +293,20 @@ jobs:
                   if [ -n "$FALLBACK_PAT" ]; then
                     FALL_INDEX=$(( (CURRENT_INDEX + 2) % ${#REPOS[@]} ))
                     FALL_REPO="${REPOS[$FALL_INDEX]}"
-                    GH_TOKEN="$FALLBACK_PAT" gh workflow run matrix-bench.yml \
+                    if GH_TOKEN="$FALLBACK_PAT" gh workflow run matrix-bench.yml \
                       --repo "$FALL_REPO" \
                       -f matrix_batch_id="${NEXT_BATCH}" \
-                      -f soak_duration_mins="${SOAK_DURATION}" || true
+                      -f soak_duration_mins="${SOAK_DURATION}"; then
+                      HANDOVER_TRIGGERED=true
+                    fi
                   fi
                 fi
+              fi
+
+              if [ "$HANDOVER_TRIGGERED" = "true" ]; then
+                echo "[HANDOVER] Holding ingress tunnel for 60s while successor node boots, then retiring..."
+                sleep 60
+                break
               fi
             fi
 
@@ -305,9 +324,13 @@ jobs:
           echo "=== PHASE 4: Final Workspace State Sync & Retirement ==="
           TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/code_server-state}"
 
-          # Final atomic sync of all edits and chat history
-          chmod +x scripts/code_server/sync_state.sh || true
-          ./scripts/code_server/sync_state.sh "$TARGET" || true
+          # Final atomic sync only if not already synced during clean handover
+          if [ ! -f /tmp/handover_synced ]; then
+            chmod +x scripts/code_server/sync_state.sh || true
+            ./scripts/code_server/sync_state.sh "$TARGET" || true
+          else
+            echo "[TEARDOWN] State already synced at handover; skipping duplicate upload to protect successor node state."
+          fi
 
           # Cleanly terminate tunnel agent and code-server
           sudo pkill -SIGTERM metrics-agent || true
