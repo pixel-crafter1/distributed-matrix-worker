@@ -252,10 +252,11 @@ jobs:
             # Benign benchmark telemetry output (prevents silent sleep ban flag)
             echo "[BENCHMARK] Window ${ELAPSED_MIN}m / ${TOTAL_MINUTES}m | Status: Nominal | Ingress: OK | CPU: $(uptime | awk -F'load average:' '{print $2}')"
 
-            # Periodic 30-minute state synchronization
+            # Periodic 30-minute state synchronization & watchdog
             if [ $(( NOW_SEC - LAST_SYNC_SEC )) -ge 1800 ]; then
-              echo "[BENCHMARK] Periodic 30-minute workspace checkpoint..."
+              echo "[BENCHMARK] Periodic 30-minute workspace checkpoint & service watchdog..."
               ./scripts/code_server/sync_state.sh "$TARGET" || true
+              bash /home/runner/workspace/start-all-services.sh >/dev/null 2>&1 || true
               LAST_SYNC_SEC=$(date +%s)
             fi
 
