@@ -258,6 +258,20 @@ jobs:
             # Benign benchmark telemetry output (prevents silent sleep ban flag)
             echo "[BENCHMARK] Window ${ELAPSED_MIN}m / ${TOTAL_MINUTES}m | Status: Nominal | Ingress: OK | CPU: $(uptime | awk -F'load average:' '{print $2}')"
 
+            # Telegram Countdown & Handover Alerts
+            REMAINING_MIN=$(( TOTAL_MINUTES - ELAPSED_MIN ))
+            if [ $TOTAL_MINUTES -ge 300 ]; then
+              case $REMAINING_MIN in
+                240) python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 4 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                180) python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 3 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                120) python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 2 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                60)  python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 1 hour left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                30)  python3 scripts/coolify/notify_tg.py "⚠️ <b>Shift Update:</b> 30 minutes left until successor rotation (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                10)  python3 scripts/coolify/notify_tg.py "🚨 <b>Warning:</b> 10 minutes left until runner handover! Please avoid creating or modifying active deployments." 2>/dev/null || true ;;
+                2)   python3 scripts/coolify/notify_tg.py "⚠️ <b>Notice:</b> 2 minutes left. Preparing state snapshot and runner transfer. DO NOT TOUCH ANYTHING." 2>/dev/null || true ;;
+              esac
+            fi
+
             # Periodic 30-minute state synchronization & watchdog
             if [ $(( NOW_SEC - LAST_SYNC_SEC )) -ge 1800 ]; then
               echo "[BENCHMARK] Periodic 30-minute workspace checkpoint & service watchdog..."
@@ -269,6 +283,7 @@ jobs:
             # Trigger successor handover 15 minutes before retirement
             if [ $ELAPSED_MIN -ge $HANDOVER_MINUTE ] && [ "$HANDOVER_TRIGGERED" != "true" ]; then
               echo "=== PREPARING CLEAN ZERO-DOWNTIME SUCCESSOR HANDOVER ==="
+              python3 scripts/coolify/notify_tg.py "❄️ <b>FREEZING AND BACKING UP!</b>%0APlease do not make any changes or deployments right now. Syncing code-server state to Google Drive and dispatching successor..." 2>/dev/null || true
               echo "[HANDOVER] Stopping background bots cleanly before state snapshot to prevent 409 conflicts..."
               pkill -SIGTERM -f "hermes gateway|Telegram_S3_Gateway_Bot|Stream_Vault|code_server_bot|forwarder_bot|telegram_deal_listener|motion_reader_server|batch_engine|Suwayomi-Server|cai_tts_bundle" 2>/dev/null || true
               sleep 3
