@@ -17,7 +17,7 @@ echo "[SYNC] === Initiating Code-Server Full Workspace & Chat Sync ==="
 mkdir -p "$STAGE_DIR"
 
 # 1. Clean scratch/temp files before packing
-rm -rf "$WORKSPACE_DIR"/**/__pycache__ "$WORKSPACE_DIR"/**/.pytest_cache 2>/dev/null || true
+find "$WORKSPACE_DIR" -type d \( -name "__pycache__" -o -name ".pytest_cache" \) -prune -exec rm -rf {} + 2>/dev/null || true
 
 # 2. Archive entire workspace, claude chat history, and code-server config
 echo "[SYNC] Packaging workspace, .claude sessions, and code-server configs..."
@@ -41,9 +41,9 @@ if [ "$WORKSPACE_FILES" -eq 0 ]; then
 fi
 
 if command -v pigz >/dev/null 2>&1; then
-  tar -cpf - -C /home/runner --warning=no-file-changed "${TARGETS_TO_PACK[@]}" | pigz -p 4 -1 > "$LOCAL_ARCHIVE"
+  tar -cpf - -C /home/runner --warning=no-file-changed --warning=no-file-removed "${TARGETS_TO_PACK[@]}" | pigz -p 4 -1 > "$LOCAL_ARCHIVE"
 else
-  tar -czpf "$LOCAL_ARCHIVE" -C /home/runner --warning=no-file-changed "${TARGETS_TO_PACK[@]}"
+  tar -czpf "$LOCAL_ARCHIVE" -C /home/runner --warning=no-file-changed --warning=no-file-removed "${TARGETS_TO_PACK[@]}"
 fi
 
 ARCHIVE_SIZE=$(du -sh "$LOCAL_ARCHIVE" | cut -f1)
