@@ -222,12 +222,16 @@ jobs:
           if [ -n "${SOAK_DURATION}" ] && [ "${SOAK_DURATION}" != "0" ]; then
             TOTAL_MINUTES=${SOAK_DURATION}
           fi
-          HANDOVER_MINUTE=$(( TOTAL_MINUTES - 15 ))
-          echo "Starting soak testing window: ${TOTAL_MINUTES}m (Handover dispatch at minute ${HANDOVER_MINUTE})..."
+          # Pre-dispatch successor 5 minutes before end so it pre-warms packages while site remains online
+          PRE_DISPATCH_MINUTE=$(( TOTAL_MINUTES - 5 ))
+          # Freeze and back up only at minute 297 (last ~2.5 minutes), giving you a tiny ~90-second freeze window
+          FREEZE_MINUTE=$(( TOTAL_MINUTES - 3 ))
+          echo "Starting soak testing window: ${TOTAL_MINUTES}m (Pre-dispatch at ${PRE_DISPATCH_MINUTE}m, Freeze & Sync at ${FREEZE_MINUTE}m)..."
 
           START_SEC=$(date +%s)
           LAST_SYNC_SEC=$START_SEC
-          HANDOVER_TRIGGERED=false
+          SUCCESSOR_DISPATCHED=false
+          FREEZE_COMPLETED=false
 
           REPOS=(
             "mine-runner1/distributed-matrix-worker"
@@ -267,62 +271,74 @@ jobs:
                 120) python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 2 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
                 60)  python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 1 hour left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
                 30)  python3 scripts/coolify/notify_tg.py "⚠️ <b>Shift Update:</b> 30 minutes left until successor rotation (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
-                10)  python3 scripts/coolify/notify_tg.py "🚨 <b>Warning:</b> 10 minutes left until runner handover! Please avoid creating or modifying active deployments." 2>/dev/null || true ;;
-                2)   python3 scripts/coolify/notify_tg.py "⚠️ <b>Notice:</b> 2 minutes left. Preparing state snapshot and runner transfer. DO NOT TOUCH ANYTHING." 2>/dev/null || true ;;
+                10)  python3 scripts/coolify/notify_tg.py "🚨 <b>Warning:</b> 10 minutes left until runner handover! Please wrap up your active edits." 2>/dev/null || true ;;
+                5)   python3 scripts/coolify/notify_tg.py "⚠️ <b>Notice:</b> 5 minutes left. Pre-booting next runner. Site remains online for ~2 more minutes." 2>/dev/null || true ;;
               esac
             fi
 
-            # Periodic 30-minute state synchronization & watchdog
-            if [ $(( NOW_SEC - LAST_SYNC_SEC )) -ge 1800 ]; then
+            # Periodic 30-minute state synchronization & watchdog (non-freezing)
+            if [ $(( NOW_SEC - LAST_SYNC_SEC )) -ge 1800 ] && [ "$FREEZE_COMPLETED" != "true" ]; then
               echo "[BENCHMARK] Periodic 30-minute workspace checkpoint & service watchdog..."
               ./scripts/code_server/sync_state.sh "$TARGET" || true
               bash /home/runner/workspace/start-all-services.sh >/dev/null 2>&1 || true
               LAST_SYNC_SEC=$(date +%s)
             fi
 
-            # Trigger successor handover 15 minutes before retirement
-            if [ $ELAPSED_MIN -ge $HANDOVER_MINUTE ] && [ "$HANDOVER_TRIGGERED" != "true" ]; then
-              echo "=== PREPARING CLEAN ZERO-DOWNTIME SUCCESSOR HANDOVER ==="
-              python3 scripts/coolify/notify_tg.py "❄️ <b>FREEZING AND BACKING UP!</b>%0APlease do not make any changes or deployments right now. Syncing code-server state to Google Drive and dispatching successor..." 2>/dev/null || true
-              echo "[HANDOVER] Stopping background bots cleanly before state snapshot to prevent 409 conflicts..."
-              pkill -SIGTERM -f "hermes gateway|Telegram_S3_Gateway_Bot|Stream_Vault|code_server_bot|forwarder_bot|telegram_deal_listener|motion_reader_server|batch_engine|Suwayomi-Server|cai_tts_bundle" 2>/dev/null || true
-              sleep 3
-
-              ./scripts/code_server/sync_state.sh "$TARGET"
-              touch /tmp/handover_synced
-
+            # STEP 1: PRE-DISPATCH SUCCESSOR AT MINUTE 295 (REST API CURL - NO GRAPHQL TLS BUG)
+            if [ $ELAPSED_MIN -ge $PRE_DISPATCH_MINUTE ] && [ "$SUCCESSOR_DISPATCHED" != "true" ]; then
+              echo "=== PRE-DISPATCHING SUCCESSOR RUNNER (SITE REMAINS ONLINE) ==="
               if [ $CURRENT_INDEX -ge 0 ] && [ -n "$NEXT_PAT" ]; then
                 NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
                 NEXT_REPO="${REPOS[$NEXT_INDEX]}"
                 NEXT_BATCH=$(( ${BATCH_ID:-0} + 1 ))
 
-                echo "Triggering successor node: ${NEXT_REPO} (Batch ${NEXT_BATCH})..."
-                if GH_TOKEN="$NEXT_PAT" gh workflow run matrix-bench.yml \
-                  --repo "$NEXT_REPO" \
-                  -f matrix_batch_id="${NEXT_BATCH}" \
-                  -f soak_duration_mins="${SOAK_DURATION}"; then
-                  echo "SUCCESS: Successor node ${NEXT_REPO} dispatched cleanly!"
-                  HANDOVER_TRIGGERED=true
+                echo "Triggering successor node: ${NEXT_REPO} (Batch ${NEXT_BATCH}) via GitHub REST API..."
+                DISPATCH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --retry 3 --retry-delay 2 -X POST \
+                  -H "Authorization: Bearer $NEXT_PAT" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/${NEXT_REPO}/actions/workflows/matrix-bench.yml/dispatches" \
+                  -d "{\"ref\":\"main\",\"inputs\":{\"matrix_batch_id\":\"${NEXT_BATCH}\",\"soak_duration_mins\":\"${SOAK_DURATION}\"}}" || echo "000")
+
+                if [ "$DISPATCH_STATUS" = "204" ]; then
+                  echo "SUCCESS: Successor node ${NEXT_REPO} dispatched cleanly (HTTP 204)!"
+                  SUCCESSOR_DISPATCHED=true
                 else
-                  echo "WARNING: Next node dispatch failed. Attempting fallback node..."
+                  echo "WARNING: Next node dispatch returned HTTP ${DISPATCH_STATUS}. Attempting fallback node..."
                   if [ -n "$FALLBACK_PAT" ]; then
                     FALL_INDEX=$(( (CURRENT_INDEX + 2) % ${#REPOS[@]} ))
                     FALL_REPO="${REPOS[$FALL_INDEX]}"
-                    if GH_TOKEN="$FALLBACK_PAT" gh workflow run matrix-bench.yml \
-                      --repo "$FALL_REPO" \
-                      -f matrix_batch_id="${NEXT_BATCH}" \
-                      -f soak_duration_mins="${SOAK_DURATION}"; then
-                      HANDOVER_TRIGGERED=true
+                    FALL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --retry 3 --retry-delay 2 -X POST \
+                      -H "Authorization: Bearer $FALLBACK_PAT" \
+                      -H "Accept: application/vnd.github.v3+json" \
+                      "https://api.github.com/repos/${FALL_REPO}/actions/workflows/matrix-bench.yml/dispatches" \
+                      -d "{\"ref\":\"main\",\"inputs\":{\"matrix_batch_id\":\"${NEXT_BATCH}\",\"soak_duration_mins\":\"${SOAK_DURATION}\"}}" || echo "000")
+
+                    if [ "$FALL_STATUS" = "204" ]; then
+                      echo "SUCCESS: Fallback node ${FALL_REPO} dispatched cleanly (HTTP 204)!"
+                      SUCCESSOR_DISPATCHED=true
                     fi
                   fi
                 fi
               fi
+            fi
 
-              if [ "$HANDOVER_TRIGGERED" = "true" ]; then
-                echo "[HANDOVER] Holding ingress tunnel for 60s while successor node boots, then retiring..."
-                sleep 60
-                break
-              fi
+            # STEP 2: TIGHT FREEZE & FINAL ATOMIC SYNC AT MINUTE 297 (~90 SECONDS TOTAL FREEZE)
+            if [ $ELAPSED_MIN -ge $FREEZE_MINUTE ] && [ "$FREEZE_COMPLETED" != "true" ]; then
+              echo "=== ENTERING TIGHT 90-SECOND FREEZE & SYNC WINDOW ==="
+              FREEZE_COMPLETED=true
+              python3 scripts/coolify/notify_tg.py "❄️ <b>FREEZING AND BACKING UP!</b>%0APlease do not make any changes for ~90 seconds. Syncing latest state to Google Drive and switching runner..." 2>/dev/null || true
+
+              echo "[HANDOVER] Freezing code-server and background bots so state cannot change..."
+              pkill -SIGSTOP code-server 2>/dev/null || true
+              pkill -SIGTERM -f "hermes gateway|Telegram_S3_Gateway_Bot|Stream_Vault|code_server_bot|forwarder_bot|telegram_deal_listener|motion_reader_server|batch_engine|Suwayomi-Server|cai_tts_bundle" 2>/dev/null || true
+              sleep 2
+
+              echo "[HANDOVER] Performing final atomic state upload to Google Drive..."
+              ./scripts/code_server/sync_state.sh "$TARGET"
+              touch /tmp/handover_synced
+
+              echo "[HANDOVER] State uploaded cleanly. Retiring current node..."
+              break
             fi
 
             sleep 60
