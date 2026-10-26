@@ -19,19 +19,30 @@ echo "[HYDRATE] === Initializing Standalone Code-Server Environment ==="
 mkdir -p "$STAGE_DIR" "$WORKSPACE_DIR" "$CLAUDE_DIR" "$CONFIG_DIR"
 sudo chown -R runner:docker "$WORKSPACE_DIR" "$CLAUDE_DIR" /home/runner/.config /home/runner/.local 2>/dev/null || true
 
-# 1. Check for dedicated Code-Server State Archive (Primary & Fallback targets)
+# 1. Check for dedicated Code-Server State Archive across all possible storage targets
 echo "[HYDRATE] Checking for existing code_server_bundle.tar.gz on cloud storage..."
 CODE_SERVER_ARCHIVE_VALID=false
 BUNDLE_SOURCE=""
 
-if rclone ls "$STORAGE_TARGET/code_server_bundle.tar.gz" >/dev/null 2>&1; then
-  BUNDLE_SOURCE="$STORAGE_TARGET/code_server_bundle.tar.gz"
-elif rclone ls "$FALLBACK_STORAGE_TARGET/code_server_bundle.tar.gz" >/dev/null 2>&1; then
-  BUNDLE_SOURCE="$FALLBACK_STORAGE_TARGET/code_server_bundle.tar.gz"
-fi
+POSSIBLE_TARGETS=(
+  "gdrive:coolify-relay-state/coolify-state"
+  "gdrive:coolify-relay-state/code_server-state"
+  "${STORAGE_TARGET}"
+  "${1:-}"
+)
+
+for target in "${POSSIBLE_TARGETS[@]}"; do
+  [ -z "$target" ] && continue
+  echo "[HYDRATE] Probing $target/code_server_bundle.tar.gz ..."
+  if rclone ls "$target/code_server_bundle.tar.gz" >/dev/null 2>&1; then
+    BUNDLE_SOURCE="$target/code_server_bundle.tar.gz"
+    echo "[HYDRATE] SUCCESS: Found code_server_bundle.tar.gz at $BUNDLE_SOURCE!"
+    break
+  fi
+done
 
 if [ -n "$BUNDLE_SOURCE" ]; then
-  echo "[HYDRATE] Found code_server_bundle.tar.gz at $BUNDLE_SOURCE. Downloading..."
+  echo "[HYDRATE] Downloading $BUNDLE_SOURCE to local stage..."
   rclone copyto "$BUNDLE_SOURCE" "$STAGE_DIR/code_server_bundle.tar.gz" \
     --drive-chunk-size=256M --buffer-size=64M --retries=5 --timeout=5m
 
