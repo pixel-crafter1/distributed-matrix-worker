@@ -6,7 +6,7 @@
 # ==============================================================================
 set -euo pipefail
 
-STORAGE_TARGET="${1:-gdrive:coolify-relay-state/code_server-state}"
+STORAGE_TARGET="${1:-gdrive:coolify-relay-state/coolify-state}"
 STAGE_DIR="/tmp/code_server_stage"
 WORKSPACE_DIR="/home/runner/workspace"
 CLAUDE_DIR="/home/runner/.claude"
@@ -51,14 +51,14 @@ fi
 ARCHIVE_SIZE=$(du -sh "$LOCAL_ARCHIVE" | cut -f1)
 echo "[SYNC] Archive created successfully ($ARCHIVE_SIZE). Uploading to cloud storage..."
 
-# 3. Resilient atomic upload via .partial
-rclone copyto "$LOCAL_ARCHIVE" "$STORAGE_TARGET/code_server_bundle.tar.gz.partial" \
+# 3. Direct in-place overwrite to Google Drive without duplicate File IDs or orphan .partial files
+rclone copyto "$LOCAL_ARCHIVE" "$STORAGE_TARGET/code_server_bundle.tar.gz" \
   --drive-chunk-size=256M \
   --drive-upload-cutoff=32M \
+  --drive-use-trash=false \
   --buffer-size=64M \
   --use-mmap \
   --retries=5 \
-  --timeout=3m
+  --timeout=5m
 
-rclone moveto "$STORAGE_TARGET/code_server_bundle.tar.gz.partial" "$STORAGE_TARGET/code_server_bundle.tar.gz"
 echo "[SYNC] Full Code-Server state synchronized successfully ($ARCHIVE_SIZE)."
