@@ -110,11 +110,32 @@ if [ "$CODE_SERVER_ARCHIVE_VALID" != "true" ] && (rclone ls "$LEGACY_VOLUMES_TAR
   rm -rf "$MIGRATE_TEMP"
 fi
 
-# 3. Bridge Claude memory paths if migrating across workspace roots (-config-workspace vs -home-runner-workspace)
-if [ -d "$CLAUDE_DIR/projects/-config-workspace/memory" ] && [ ! -d "$CLAUDE_DIR/projects/-home-runner-workspace/memory" ]; then
-  echo "[HYDRATE] Bridging Claude persistent memories to -home-runner-workspace..."
-  mkdir -p "$CLAUDE_DIR/projects/-home-runner-workspace"
-  cp -rn "$CLAUDE_DIR/projects/-config-workspace/memory" "$CLAUDE_DIR/projects/-home-runner-workspace/"
+# 3. Bi-directional Claude Code chat session & memory bridging across workspace roots
+mkdir -p "$CLAUDE_DIR/projects/-config-workspace" "$CLAUDE_DIR/projects/-home-runner-workspace"
+if [ -d "$CLAUDE_DIR/projects/-config-workspace" ] && [ -d "$CLAUDE_DIR/projects/-home-runner-workspace" ]; then
+  echo "[HYDRATE] Bridging Claude persistent memories and past chat sessions bi-directionally..."
+  for f in "$CLAUDE_DIR/projects/-config-workspace"/*; do
+    fname=$(basename "$f")
+    [ "$fname" = "*" ] && continue
+    if [ ! -e "$CLAUDE_DIR/projects/-home-runner-workspace/$fname" ]; then
+      if [ -d "$f" ]; then
+        cp -rn "$f" "$CLAUDE_DIR/projects/-home-runner-workspace/" 2>/dev/null || true
+      else
+        ln "$f" "$CLAUDE_DIR/projects/-home-runner-workspace/$fname" 2>/dev/null || cp -n "$f" "$CLAUDE_DIR/projects/-home-runner-workspace/" 2>/dev/null || true
+      fi
+    fi
+  done
+  for f in "$CLAUDE_DIR/projects/-home-runner-workspace"/*; do
+    fname=$(basename "$f")
+    [ "$fname" = "*" ] && continue
+    if [ ! -e "$CLAUDE_DIR/projects/-config-workspace/$fname" ]; then
+      if [ -d "$f" ]; then
+        cp -rn "$f" "$CLAUDE_DIR/projects/-config-workspace/" 2>/dev/null || true
+      else
+        ln "$f" "$CLAUDE_DIR/projects/-config-workspace/$fname" 2>/dev/null || cp -n "$f" "$CLAUDE_DIR/projects/-config-workspace/" 2>/dev/null || true
+      fi
+    fi
+  done
 fi
 
 # 4. Ensure permissions and directories are clean
@@ -131,26 +152,17 @@ ln -sfn /home/runner/.hermes /config/.hermes
 ln -sfn /home/runner/.suwayomi_state /config/suwayomi_state
 ln -sf "$WORKSPACE_DIR"/start*.sh /config/ 2>/dev/null || true
 
-# If hermes-venv or .local are missing from /config, extract them from archive
-if [ ! -d "/config/hermes-venv" ]; then
-  if [ ! -f "$STAGE_DIR/volumes_bundle.tar.gz" ] && (rclone ls "$LEGACY_VOLUMES_TARGET" >/dev/null 2>&1); then
-    echo "[HYDRATE] Downloading runtime bundle from $LEGACY_VOLUMES_TARGET..."
-    rclone copyto "$LEGACY_VOLUMES_TARGET" "$STAGE_DIR/volumes_bundle.tar.gz" \
-      --drive-chunk-size=256M --buffer-size=64M --retries=5 --timeout=3m
-  fi
-  if [ -f "$STAGE_DIR/volumes_bundle.tar.gz" ]; then
-    echo "[HYDRATE] Restoring /config/hermes-venv and .local from volume archive..."
-    tar -zxf "$STAGE_DIR/volumes_bundle.tar.gz" \
-      --strip-components=3 \
-      -C /config \
-      ./o7fnohdje503ojdahkkscdqi_code-server-config/_data/hermes-venv \
-      ./o7fnohdje503ojdahkkscdqi_code-server-config/_data/.local 2>/dev/null || true
-    # Seed /home/runner/.hermes from legacy volume only if not already restored from code_server_bundle
-    if [ ! -f "/home/runner/.hermes/config.yaml" ]; then
-      tar -zxf "$STAGE_DIR/volumes_bundle.tar.gz" \
-        --strip-components=3 \
-        -C /home/runner \
-        ./o7fnohdje503ojdahkkscdqi_code-server-config/_data/.hermes 2>/dev/null || true
-    fi
-  fi
+# Step 5b: Persistent virtualenv symlink to workspace & automated fallback bootstrap
+if [ -d "$WORKSPACE_DIR/.hermes-venv" ]; then
+  echo "[HYDRATE] Linking persistent virtualenv $WORKSPACE_DIR/.hermes-venv -> /config/hermes-venv..."
+  ln -sfn "$WORKSPACE_DIR/.hermes-venv" /config/hermes-venv
+elif [ ! -x "/config/hermes-venv/bin/python" ]; then
+  echo "[HYDRATE] Initializing fresh runtime environment in $WORKSPACE_DIR/.hermes-venv..."
+  python3 -m venv "$WORKSPACE_DIR/.hermes-venv"
+  ln -sfn "$WORKSPACE_DIR/.hermes-venv" /config/hermes-venv
+  /config/hermes-venv/bin/pip install --upgrade pip setuptools wheel --no-cache-dir
+  /config/hermes-venv/bin/pip install --no-cache-dir \
+    aiohttp "telethon==1.44.0" tgcrypto cryptg \
+    pyTelegramBotAPI requests cryptography flask APScheduler PyGithub psutil Pillow curl_cffi \
+    fastapi uvicorn websockets python-dotenv miniaudio pydantic numpy playwright beautifulsoup4 "certifi==2026.5.20" hermes-agent
 fi
