@@ -90,7 +90,10 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== PHASE 2: Restoring Workspace State & Claude History ==="
-          TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/code_server-state}"
+          TARGET="gdrive:coolify-relay-state/coolify-state"
+          if [ -n "${STORAGE_TARGET:-}" ] && [ "${STORAGE_TARGET}" != "gdrive:coolify-relay-state/code_server-state" ]; then
+            TARGET="${STORAGE_TARGET}"
+          fi
 
           chmod +x scripts/code_server/hydrate_state.sh scripts/code_server/sync_state.sh
           ./scripts/code_server/hydrate_state.sh "$TARGET"
