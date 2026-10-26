@@ -6,7 +6,8 @@
 # ==============================================================================
 set -euo pipefail
 
-STORAGE_TARGET="${1:-gdrive:coolify-relay-state/code_server-state}"
+STORAGE_TARGET="${1:-gdrive:coolify-relay-state/coolify-state}"
+FALLBACK_STORAGE_TARGET="gdrive:coolify-relay-state/code_server-state"
 LEGACY_VOLUMES_TARGET="gdrive:coolify-relay-state/coolify-state/volumes_bundle.tar.gz"
 STAGE_DIR="/tmp/code_server_stage"
 WORKSPACE_DIR="/home/runner/workspace"
@@ -18,13 +19,21 @@ echo "[HYDRATE] === Initializing Standalone Code-Server Environment ==="
 mkdir -p "$STAGE_DIR" "$WORKSPACE_DIR" "$CLAUDE_DIR" "$CONFIG_DIR"
 sudo chown -R runner:docker "$WORKSPACE_DIR" "$CLAUDE_DIR" /home/runner/.config /home/runner/.local 2>/dev/null || true
 
-# 1. Check for dedicated Code-Server State Archive first
+# 1. Check for dedicated Code-Server State Archive (Primary & Fallback targets)
 echo "[HYDRATE] Checking for existing code_server_bundle.tar.gz on cloud storage..."
 CODE_SERVER_ARCHIVE_VALID=false
-if rclone check "$STORAGE_TARGET/code_server_bundle.tar.gz" "$STAGE_DIR" --one-way 2>/dev/null || rclone ls "$STORAGE_TARGET/code_server_bundle.tar.gz" >/dev/null 2>&1; then
-  echo "[HYDRATE] Found code_server_bundle.tar.gz. Downloading..."
-  rclone copyto "$STORAGE_TARGET/code_server_bundle.tar.gz" "$STAGE_DIR/code_server_bundle.tar.gz" \
-    --drive-chunk-size=256M --buffer-size=64M --retries=5 --timeout=3m
+BUNDLE_SOURCE=""
+
+if rclone ls "$STORAGE_TARGET/code_server_bundle.tar.gz" >/dev/null 2>&1; then
+  BUNDLE_SOURCE="$STORAGE_TARGET/code_server_bundle.tar.gz"
+elif rclone ls "$FALLBACK_STORAGE_TARGET/code_server_bundle.tar.gz" >/dev/null 2>&1; then
+  BUNDLE_SOURCE="$FALLBACK_STORAGE_TARGET/code_server_bundle.tar.gz"
+fi
+
+if [ -n "$BUNDLE_SOURCE" ]; then
+  echo "[HYDRATE] Found code_server_bundle.tar.gz at $BUNDLE_SOURCE. Downloading..."
+  rclone copyto "$BUNDLE_SOURCE" "$STAGE_DIR/code_server_bundle.tar.gz" \
+    --drive-chunk-size=256M --buffer-size=64M --retries=5 --timeout=5m
 
   # Check if archive actually has workspace files (more than 15 entries)
   ENTRY_COUNT=$(tar -tzf "$STAGE_DIR/code_server_bundle.tar.gz" 2>/dev/null | wc -l || echo 0)
