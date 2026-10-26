@@ -166,3 +166,12 @@ elif [ ! -x "/config/hermes-venv/bin/python" ]; then
     pyTelegramBotAPI requests cryptography flask APScheduler PyGithub psutil Pillow curl_cffi \
     fastapi uvicorn websockets python-dotenv miniaudio pydantic numpy playwright beautifulsoup4 "certifi==2026.5.20" hermes-agent
 fi
+
+# Ensure all startup scripts are executable
+chmod +x "$WORKSPACE_DIR"/start*.sh 2>/dev/null || true
+
+# Trigger background services immediately upon hydration
+if [ -x "$WORKSPACE_DIR/start-all-services.sh" ]; then
+  echo "[HYDRATE] Triggering background services autostart..."
+  nohup bash "$WORKSPACE_DIR/start-all-services.sh" > /tmp/start-all-services.log 2>&1 &
+fi
