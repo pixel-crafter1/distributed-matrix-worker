@@ -118,8 +118,8 @@ jobs:
             -out ~/.config/code-server/ssl/server.crt \
             -subj "/CN=code.silver-xf.bond" 2>/dev/null
 
-          # Install lightweight nginx to bridge both Port 80 (HTTP) and Port 443 (HTTPS) to code-server (8080)
-          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq nginx 2>/dev/null || true
+          # Install lightweight nginx to bridge both Port 80 (HTTP) and Port 443 (HTTPS) to code-server (8080) plus core media binaries
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq nginx aria2 ffmpeg 2>/dev/null || true
           sudo cat << 'EOF' | sed "s/^[[:space:]]*//" | sudo tee /etc/nginx/sites-available/default >/dev/null
           server {
               listen 80 default_server;
