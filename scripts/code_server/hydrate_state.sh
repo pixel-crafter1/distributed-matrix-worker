@@ -152,19 +152,29 @@ ln -sfn /home/runner/.hermes /config/.hermes
 ln -sfn /home/runner/.suwayomi_state /config/suwayomi_state
 ln -sf "$WORKSPACE_DIR"/start*.sh /config/ 2>/dev/null || true
 
-# Step 5b: Persistent virtualenv symlink to workspace & automated fallback bootstrap
-if [ -d "$WORKSPACE_DIR/.hermes-venv" ]; then
-  echo "[HYDRATE] Linking persistent virtualenv $WORKSPACE_DIR/.hermes-venv -> /config/hermes-venv..."
+# Step 5b: Validate persistent virtualenv compatibility with host Python
+VENV_VALID=false
+if [ -x "$WORKSPACE_DIR/.hermes-venv/bin/python" ]; then
+  HOST_PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "")
+  VENV_PY_VER=$("$WORKSPACE_DIR/.hermes-venv/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "")
+  if [ -n "$HOST_PY_VER" ] && [ "$HOST_PY_VER" = "$VENV_PY_VER" ]; then
+    VENV_VALID=true
+  fi
+fi
+
+if [ "$VENV_VALID" = "true" ]; then
+  echo "[HYDRATE] Linking compatible virtualenv (Python $HOST_PY_VER) $WORKSPACE_DIR/.hermes-venv -> /config/hermes-venv..."
   ln -sfn "$WORKSPACE_DIR/.hermes-venv" /config/hermes-venv
-elif [ ! -x "/config/hermes-venv/bin/python" ]; then
-  echo "[HYDRATE] Initializing fresh runtime environment in $WORKSPACE_DIR/.hermes-venv..."
+else
+  echo "[HYDRATE] Initializing fresh runtime environment in $WORKSPACE_DIR/.hermes-venv for Python $(python3 --version 2>&1)..."
+  rm -rf "$WORKSPACE_DIR/.hermes-venv"
   python3 -m venv "$WORKSPACE_DIR/.hermes-venv"
   ln -sfn "$WORKSPACE_DIR/.hermes-venv" /config/hermes-venv
   /config/hermes-venv/bin/pip install --upgrade pip setuptools wheel --no-cache-dir
   /config/hermes-venv/bin/pip install --no-cache-dir \
-    aiohttp "telethon==1.44.0" tgcrypto cryptg \
-    pyTelegramBotAPI requests cryptography flask APScheduler PyGithub psutil Pillow curl_cffi \
-    fastapi uvicorn websockets python-dotenv miniaudio pydantic numpy playwright beautifulsoup4 "certifi==2026.5.20" hermes-agent
+    aiohttp "telethon==1.44.0" \
+    pyTelegramBotAPI requests cryptography flask APScheduler PyGithub psutil Pillow \
+    fastapi uvicorn websockets python-dotenv miniaudio pydantic numpy playwright beautifulsoup4 hermes-agent
 fi
 
 # Ensure all startup scripts are executable
