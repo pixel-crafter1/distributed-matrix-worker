@@ -242,7 +242,7 @@ jobs:
             "12stack-phantom/distributed-matrix-worker"
             "ihjjjhknjkj8878/distributed-matrix-worker"
             "mine-stack1/distributed-matrix-worker"
-            "dust-scrubber-lab/distributed-matrix-worker"
+            "raise-borer-code/distributed-matrix-worker"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
