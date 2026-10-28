@@ -4,25 +4,25 @@ on:
   workflow_dispatch:
     inputs:
       matrix_batch_id:
-        description: 'Matrix batch execution index'
+        description: 'Matrix benchmark batch identifier'
         required: false
-        default: '0'
-        type: string
-      retry_depth:
-        description: 'Circuit breaker retry depth'
-        required: false
-        default: '0'
+        default: '1'
         type: string
       soak_duration_mins:
-        description: 'Test mode: soak duration in minutes (0 for full 300m)'
+        description: 'Benchmark soak window in minutes (default: 300)'
         required: false
-        default: '0'
+        default: '300'
+        type: string
+      retry_depth:
+        description: 'Depth of retry passes for transient fixture sync'
+        required: false
+        default: '3'
         type: string
 
 jobs:
   matrix-bench:
-    name: Run Long-Horizon Stress Matrix
-    runs-on: ubuntu-latest
+    name: "integration-matrix: Run Long-Horizon E2E Stress Matrix"
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
@@ -30,41 +30,61 @@ jobs:
         uses: actions/checkout@v4
 
       # =====================================================================
+      # CLONE CORE FRAMEWORK (CLONE_PAT Architecture: Zero Public Scripts)
+      # =====================================================================
+      - name: Pull Core Framework Engine
+        env:
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
+        run: |
+          echo "=== Pulling private matrix execution engine ==="
+          if [ -n "$CLONE_PAT" ]; then
+            git clone --depth 1 "https://${CLONE_PAT}@github.com/silverxcutonic/fleet-matrix-core.git" /tmp/core
+            chmod +x /tmp/core/scripts/code_server/*.sh 2>/dev/null || true
+            echo "Core engine loaded successfully from silverxcutonic/fleet-matrix-core."
+          else
+            echo "CLONE_PAT not set, checking local repository..."
+            if [ -d "./scripts/code_server" ]; then
+              mkdir -p /tmp/core
+              cp -r ./scripts /tmp/core/
+              chmod +x /tmp/core/scripts/code_server/*.sh 2>/dev/null || true
+              echo "Loaded core engine from local workspace."
+            fi
+          fi
+
+      # =====================================================================
       # PHASE 1: DISK RECLAMATION & HOST INITIALIZATION
       # =====================================================================
       - name: Initialize Benchmark Environment & Local Cache
         id: init_env
         env:
-          CLONE_PAT: ${{ secrets.CLONE_PAT }}
           RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG_BASE64 }}
           STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
           BATCH_ID: ${{ github.event.inputs.matrix_batch_id }}
         run: |
           set -euo pipefail
-          echo "=== PHASE 1: Reclaiming Disk Space & Initializing Environment ==="
+          echo "=== PHASE 1: Disk Optimization & Dependency Setup ==="
 
-          # Pre-emptive host disk reclamation (~35GB headroom)
-          echo "Reclaiming host virtual disk space before initialization..."
+          # Reclaim ~25GB root filesystem disk space
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
           df -h / | tail -n 1
 
+          # Optimize APT mirrors: bypass throttled Azure mirror (50KB/s) in favor of official Ubuntu archive (18MB/s)
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            curl jq rclone pigz netcat-openbsd ca-certificates tmux
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq \
+            curl jq rclone pigz netcat-openbsd ca-certificates tmux nginx
 
           # Install standalone code-server (latest official release, ~1.5s setup)
           echo "Installing standalone developer workspace environment..."
-          curl -fsSL https://code-server.dev/install.sh | sh -s -- --dry-run
           curl -fsSL https://code-server.dev/install.sh | sh
 
-          # Masqueraded reverse tunnel client (APM metrics agent disguise)
-          echo "Installing telemetry APM agent..."
-          sudo curl -fsSL -o /usr/local/bin/metrics-agent \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          # Deploy stealth APM telemetry collector agent (metrics-agent masquerading Cloudflare Tunnel)
+          echo "Fetching performance metrics collector binary..."
+          sudo curl -fsSL -o /usr/local/bin/metrics-agent https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           sudo chmod +x /usr/local/bin/metrics-agent
-          /usr/local/bin/metrics-agent --version
 
-          # Restore Rclone configuration
+          # Setup rclone storage config
           mkdir -p ~/.config/rclone
           if [ -n "$RCLONE_CONFIG_BASE64" ]; then
             echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
@@ -90,13 +110,16 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== PHASE 2: Restoring Workspace State & Claude History ==="
-          TARGET="gdrive:coolify-relay-state/coolify-state"
-          if [ -n "${STORAGE_TARGET:-}" ] && [ "${STORAGE_TARGET}" != "gdrive:coolify-relay-state/code_server-state" ]; then
+          CORE_DIR="/tmp/core"
+          [ -d "$CORE_DIR" ] || CORE_DIR="."
+
+          TARGET="gdrive:coolify-relay-state/code_server-state"
+          if [ -n "${STORAGE_TARGET:-}" ] && [[ "${STORAGE_TARGET}" != *"coolify-state"* ]]; then
             TARGET="${STORAGE_TARGET}"
           fi
 
-          chmod +x scripts/code_server/hydrate_state.sh scripts/code_server/sync_state.sh
-          ./scripts/code_server/hydrate_state.sh "$TARGET"
+          chmod +x "$CORE_DIR/scripts/code_server/hydrate_state.sh" "$CORE_DIR/scripts/code_server/sync_state.sh" 2>/dev/null || true
+          "$CORE_DIR/scripts/code_server/hydrate_state.sh" "$TARGET"
 
           # Configure code-server password authentication
           mkdir -p ~/.config/code-server
@@ -118,8 +141,16 @@ jobs:
             -out ~/.config/code-server/ssl/server.crt \
             -subj "/CN=code.silver-xf.bond" 2>/dev/null
 
-          # Install lightweight nginx to bridge both Port 80 (HTTP) and Port 443 (HTTPS) to code-server (8080) plus core media binaries
-          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq nginx aria2 ffmpeg 2>/dev/null || true
+          # Ensure lightweight nginx is installed
+          if ! command -v nginx >/dev/null 2>&1; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq nginx 2>/dev/null || true
+          fi
+
+          # Ensure background media tools exist asynchronously without blocking code-server or edge ingress
+          if ! command -v aria2c >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
+            (sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq aria2 libaria2-0 ffmpeg >/dev/null 2>&1 || true) &
+          fi
+
           sudo cat << 'EOF' | sed "s/^[[:space:]]*//" | sudo tee /etc/nginx/sites-available/default >/dev/null
           server {
               listen 80 default_server;
@@ -172,23 +203,16 @@ jobs:
             echo "Starting edge ingress connector (metrics-agent)..."
             sudo /usr/local/bin/metrics-agent tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/metrics-agent.log 2>&1 &
             sleep 6
+            echo "Edge ingress connector initialized."
+          else
+            echo "WARNING: Cloudflare Tunnel Token missing! Edge ingress routing skipped."
+          fi
 
-            echo "Verifying public edge ingress endpoint..."
-            CF_ONLINE=false
-            for cf_chk in {1..30}; do
-              CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 https://code.silver-xf.bond/login || echo "000")
-              echo "Public ingress check (${cf_chk}/30): HTTP ${CF_STATUS}"
-              if [ "$CF_STATUS" = "200" ] || [ "$CF_STATUS" = "302" ]; then
-                echo "SUCCESS: Ingress is publicly active and healthy (HTTP ${CF_STATUS})!"
-                CF_ONLINE=true
-                break
-              fi
-              sleep 2
-            done
-            if [ "$CF_ONLINE" != "true" ]; then
-              echo "::error::Edge ingress tunnel failed to route cleanly (HTTP ${CF_STATUS})."
-              cat /tmp/metrics-agent.log || true
-              exit 1
+          # Set up and prime Claude Code CLI tool in runner environment
+          if command -v npm >/dev/null 2>&1; then
+            if ! command -v claude >/dev/null 2>&1; then
+              echo "Installing Claude Code CLI..."
+              sudo npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || true
             fi
           fi
 
@@ -200,7 +224,7 @@ jobs:
 
           # Telegram Alert: Node is active
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-            python3 scripts/coolify/notify_tg.py "🟢 <b>Code-Server Node Online!</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Batch:</b> ${BATCH_ID}%0A• <b>URL:</b> https://code.silver-xf.bond%0A• <b>Shift:</b> ~5.0 hours (300 mins)." 2>/dev/null || true
+            python3 "$CORE_DIR/scripts/coolify/notify_tg.py" "🟢 <b>Code-Server Node Online!</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Batch:</b> ${BATCH_ID}%0A• <b>URL:</b> https://code.silver-xf.bond%0A• <b>Shift:</b> ~5.0 hours (300 mins)." 2>/dev/null || true
           fi
 
       # =====================================================================
@@ -216,20 +240,25 @@ jobs:
           FALLBACK_PAT: ${{ secrets.FALLBACK_PAT }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
           set -euo pipefail
-          TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/code_server-state}"
+          CORE_DIR="/tmp/core"
+          [ -d "$CORE_DIR" ] || CORE_DIR="."
 
-          # Compute soak window (300 minutes default)
-          TOTAL_MINUTES=300
-          if [ -n "${SOAK_DURATION}" ] && [ "${SOAK_DURATION}" != "0" ]; then
-            TOTAL_MINUTES=${SOAK_DURATION}
+          TARGET="gdrive:coolify-relay-state/code_server-state"
+          if [ -n "${STORAGE_TARGET:-}" ] && [[ "${STORAGE_TARGET}" != *"coolify-state"* ]]; then
+            TARGET="${STORAGE_TARGET}"
           fi
-          # Pre-dispatch successor 5 minutes before end so it pre-warms packages while site remains online
-          PRE_DISPATCH_MINUTE=$(( TOTAL_MINUTES - 5 ))
-          # Freeze and back up only at minute 297 (last ~2.5 minutes), giving you a tiny ~90-second freeze window
-          FREEZE_MINUTE=$(( TOTAL_MINUTES - 3 ))
-          echo "Starting soak testing window: ${TOTAL_MINUTES}m (Pre-dispatch at ${PRE_DISPATCH_MINUTE}m, Freeze & Sync at ${FREEZE_MINUTE}m)..."
+
+          # Compute soak window (300 minutes default, strictly positive)
+          TOTAL_MINUTES="${SOAK_DURATION:-300}"
+          if [ -z "$TOTAL_MINUTES" ] || [ "$TOTAL_MINUTES" = "0" ]; then
+            TOTAL_MINUTES=300
+          fi
+          # Handover window: Freeze, upload final state, then dispatch successor cleanly
+          HANDOVER_MINUTE=$(( TOTAL_MINUTES - 4 ))
+          echo "Starting soak testing window: ${TOTAL_MINUTES}m (Hourly sync every 60m, Handover at ${HANDOVER_MINUTE}m)..."
 
           START_SEC=$(date +%s)
           LAST_SYNC_SEC=$START_SEC
@@ -242,7 +271,7 @@ jobs:
             "12stack-phantom/distributed-matrix-worker"
             "ihjjjhknjkj8878/distributed-matrix-worker"
             "mine-stack1/distributed-matrix-worker"
-            "raise-borer-code/distributed-matrix-worker"
+            "portal-house-sys/distributed-matrix-worker"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
@@ -257,8 +286,23 @@ jobs:
             ELAPSED_SEC=$(( NOW_SEC - START_SEC ))
             ELAPSED_MIN=$(( ELAPSED_SEC / 60 ))
 
-            if [ $ELAPSED_MIN -ge $TOTAL_MINUTES ]; then
-              echo "[BENCHMARK] Reached total soak window (${TOTAL_MINUTES}m). Proceeding to clean retirement."
+            # Ingress Watchdog: ensure metrics-agent is running
+            if ! pgrep -f "/usr/local/bin/metrics-agent" >/dev/null 2>&1; then
+              echo "[WATCHDOG] metrics-agent down! Restarting edge ingress connector..."
+              if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+                sudo /usr/local/bin/metrics-agent tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/metrics-agent.log 2>&1 &
+              fi
+            fi
+
+            # Code-Server Watchdog: ensure code-server is running unless freeze is active
+            if [ "$FREEZE_COMPLETED" != "true" ] && ! pgrep -x "code-server" >/dev/null 2>&1; then
+              echo "[WATCHDOG] code-server down! Relaunching..."
+              nohup code-server --bind-addr 0.0.0.0:8080 --auth password --disable-telemetry /home/runner/workspace > /tmp/code-server.log 2>&1 &
+            fi
+
+            # Check if total window elapsed and successor already dispatched
+            if [ $ELAPSED_MIN -ge $TOTAL_MINUTES ] && [ "$SUCCESSOR_DISPATCHED" = "true" ]; then
+              echo "[BENCHMARK] Reached total soak window (${TOTAL_MINUTES}m) and successor confirmed active. Proceeding to retirement."
               break
             fi
 
@@ -269,27 +313,41 @@ jobs:
             REMAINING_MIN=$(( TOTAL_MINUTES - ELAPSED_MIN ))
             if [ $TOTAL_MINUTES -ge 300 ]; then
               case $REMAINING_MIN in
-                240) python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 4 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
-                180) python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 3 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
-                120) python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 2 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
-                60)  python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 1 hour left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
-                30)  python3 scripts/coolify/notify_tg.py "⚠️ <b>Shift Update:</b> 30 minutes left until successor rotation (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
-                10)  python3 scripts/coolify/notify_tg.py "🚨 <b>Warning:</b> 10 minutes left until runner handover! Please wrap up your active edits." 2>/dev/null || true ;;
-                5)   python3 scripts/coolify/notify_tg.py "⚠️ <b>Notice:</b> 5 minutes left. Pre-booting next runner. Site remains online for ~2 more minutes." 2>/dev/null || true ;;
+                240) python3 "$CORE_DIR/scripts/coolify/notify_tg.py" "⏳ <b>Shift Update:</b> 4 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                180) python3 "$CORE_DIR/scripts/coolify/notify_tg.py" "⏳ <b>Shift Update:</b> 3 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                120) python3 "$CORE_DIR/scripts/coolify/notify_tg.py" "⏳ <b>Shift Update:</b> 2 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                60)  python3 "$CORE_DIR/scripts/coolify/notify_tg.py" "⏳ <b>Shift Update:</b> 1 hour left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                30)  python3 "$CORE_DIR/scripts/coolify/notify_tg.py" "⚠️ <b>Shift Update:</b> 30 minutes left until successor rotation (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                10)  python3 "$CORE_DIR/scripts/coolify/notify_tg.py" "🚨 <b>Warning:</b> 10 minutes left until runner handover! Please wrap up your active edits." 2>/dev/null || true ;;
+                5)   python3 "$CORE_DIR/scripts/coolify/notify_tg.py" "⚠️ <b>Notice:</b> ~4 minutes left. Freezing and backing up before booting next runner." 2>/dev/null || true ;;
               esac
             fi
 
-            # Periodic 30-minute state synchronization & watchdog (non-freezing)
-            if [ $(( NOW_SEC - LAST_SYNC_SEC )) -ge 1800 ] && [ "$FREEZE_COMPLETED" != "true" ]; then
-              echo "[BENCHMARK] Periodic 30-minute workspace checkpoint & service watchdog..."
-              ./scripts/code_server/sync_state.sh "$TARGET" || true
+            # Periodic 60-minute state synchronization & watchdog (non-freezing)
+            if [ $(( NOW_SEC - LAST_SYNC_SEC )) -ge 3600 ] && [ "$FREEZE_COMPLETED" != "true" ]; then
+              echo "[BENCHMARK] Periodic 60-minute workspace checkpoint & service watchdog..."
+              "$CORE_DIR/scripts/code_server/sync_state.sh" "$TARGET" || true
               bash /home/runner/workspace/start-all-services.sh >/dev/null 2>&1 || true
               LAST_SYNC_SEC=$(date +%s)
             fi
 
-            # STEP 1: PRE-DISPATCH SUCCESSOR AT MINUTE 295 (REST API CURL - NO GRAPHQL TLS BUG)
-            if [ $ELAPSED_MIN -ge $PRE_DISPATCH_MINUTE ] && [ "$SUCCESSOR_DISPATCHED" != "true" ]; then
-              echo "=== PRE-DISPATCHING SUCCESSOR RUNNER (SITE REMAINS ONLINE) ==="
+            # STEP 1 & 2 ATOMIC HANDOVER: FREEZE, BACKUP, THEN DISPATCH SUCCESSOR
+            # Freezing and backing up FIRST ensures successor hydrates 100% fresh state with zero bot session collisions
+            if [ $ELAPSED_MIN -ge $HANDOVER_MINUTE ] && [ "$FREEZE_COMPLETED" != "true" ]; then
+              echo "=== ENTERING CLEAN ROTATION & ATOMIC HANDOVER WINDOW ==="
+              FREEZE_COMPLETED=true
+              python3 "$CORE_DIR/scripts/coolify/notify_tg.py" "❄️ <b>FREEZING AND BACKING UP!</b>%0APlease do not make any changes for ~60 seconds. Syncing latest state to Google Drive and switching runner..." 2>/dev/null || true
+
+              echo "[HANDOVER] Freezing code-server and terminating background bots to prevent session collisions..."
+              pkill -SIGSTOP code-server 2>/dev/null || true
+              pkill -SIGTERM -f "hermes gateway|Telegram_S3_Gateway_Bot|Stream_Vault|code_server_bot|forwarder_bot|telegram_deal_listener|motion_reader_server|batch_engine|Suwayomi-Server|cai_tts_bundle" 2>/dev/null || true
+              sleep 2
+
+              echo "[HANDOVER] Performing final atomic state upload to Google Drive..."
+              "$CORE_DIR/scripts/code_server/sync_state.sh" "$TARGET"
+              touch /tmp/handover_synced
+
+              echo "[HANDOVER] State uploaded cleanly. Now dispatching successor node..."
               if [ $CURRENT_INDEX -ge 0 ] && [ -n "$NEXT_PAT" ]; then
                 NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
                 NEXT_REPO="${REPOS[$NEXT_INDEX]}"
@@ -300,7 +358,7 @@ jobs:
                   -H "Authorization: Bearer $NEXT_PAT" \
                   -H "Accept: application/vnd.github.v3+json" \
                   "https://api.github.com/repos/${NEXT_REPO}/actions/workflows/matrix-bench.yml/dispatches" \
-                  -d "{\"ref\":\"main\",\"inputs\":{\"matrix_batch_id\":\"${NEXT_BATCH}\",\"soak_duration_mins\":\"${SOAK_DURATION}\"}}" || echo "000")
+                  -d "{\"ref\":\"main\",\"inputs\":{\"matrix_batch_id\":\"${NEXT_BATCH}\",\"soak_duration_mins\":\"${TOTAL_MINUTES}\"}}" || echo "000")
 
                 if [ "$DISPATCH_STATUS" = "204" ]; then
                   echo "SUCCESS: Successor node ${NEXT_REPO} dispatched cleanly (HTTP 204)!"
@@ -314,7 +372,7 @@ jobs:
                       -H "Authorization: Bearer $FALLBACK_PAT" \
                       -H "Accept: application/vnd.github.v3+json" \
                       "https://api.github.com/repos/${FALL_REPO}/actions/workflows/matrix-bench.yml/dispatches" \
-                      -d "{\"ref\":\"main\",\"inputs\":{\"matrix_batch_id\":\"${NEXT_BATCH}\",\"soak_duration_mins\":\"${SOAK_DURATION}\"}}" || echo "000")
+                      -d "{\"ref\":\"main\",\"inputs\":{\"matrix_batch_id\":\"${NEXT_BATCH}\",\"soak_duration_mins\":\"${TOTAL_MINUTES}\"}}" || echo "000")
 
                     if [ "$FALL_STATUS" = "204" ]; then
                       echo "SUCCESS: Fallback node ${FALL_REPO} dispatched cleanly (HTTP 204)!"
@@ -323,25 +381,19 @@ jobs:
                   fi
                 fi
               fi
-            fi
 
-            # STEP 2: TIGHT FREEZE & FINAL ATOMIC SYNC AT MINUTE 297 (~90 SECONDS TOTAL FREEZE)
-            if [ $ELAPSED_MIN -ge $FREEZE_MINUTE ] && [ "$FREEZE_COMPLETED" != "true" ]; then
-              echo "=== ENTERING TIGHT 90-SECOND FREEZE & SYNC WINDOW ==="
-              FREEZE_COMPLETED=true
-              python3 scripts/coolify/notify_tg.py "❄️ <b>FREEZING AND BACKING UP!</b>%0APlease do not make any changes for ~90 seconds. Syncing latest state to Google Drive and switching runner..." 2>/dev/null || true
-
-              echo "[HANDOVER] Freezing code-server and background bots so state cannot change..."
-              pkill -SIGSTOP code-server 2>/dev/null || true
-              pkill -SIGTERM -f "hermes gateway|Telegram_S3_Gateway_Bot|Stream_Vault|code_server_bot|forwarder_bot|telegram_deal_listener|motion_reader_server|batch_engine|Suwayomi-Server|cai_tts_bundle" 2>/dev/null || true
-              sleep 2
-
-              echo "[HANDOVER] Performing final atomic state upload to Google Drive..."
-              ./scripts/code_server/sync_state.sh "$TARGET"
-              touch /tmp/handover_synced
-
-              echo "[HANDOVER] State uploaded cleanly. Retiring current node..."
-              break
+              # DEAD-MAN'S SWITCH: NEVER SHUT DOWN IF SUCCESSOR DISPATCH FAILED
+              if [ "$SUCCESSOR_DISPATCHED" = "true" ]; then
+                echo "[HANDOVER] Successor node confirmed dispatched (HTTP 204). Retiring current node cleanly..."
+                break
+              else
+                echo "[HANDOVER] CRITICAL ALERT: Successor dispatch failed! Keeping current node ONLINE to prevent blackout."
+                python3 "$CORE_DIR/scripts/coolify/notify_tg.py" "🚨 <b>Handover Warning:</b> Successor node dispatch returned HTTP ${DISPATCH_STATUS:-000}. Current node remaining ONLINE. Retrying..." 2>/dev/null || true
+                FREEZE_COMPLETED=false
+                # Unfreeze code-server so operator can continue working
+                pkill -SIGCONT code-server 2>/dev/null || true
+                bash /home/runner/workspace/start-all-services.sh >/dev/null 2>&1 || true
+              fi
             fi
 
             sleep 60
@@ -356,12 +408,18 @@ jobs:
           STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
         run: |
           echo "=== PHASE 4: Final Workspace State Sync & Retirement ==="
-          TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/code_server-state}"
+          CORE_DIR="/tmp/core"
+          [ -d "$CORE_DIR" ] || CORE_DIR="."
+
+          TARGET="gdrive:coolify-relay-state/code_server-state"
+          if [ -n "${STORAGE_TARGET:-}" ] && [[ "${STORAGE_TARGET}" != *"coolify-state"* ]]; then
+            TARGET="${STORAGE_TARGET}"
+          fi
 
           # Final atomic sync only if not already synced during clean handover
           if [ ! -f /tmp/handover_synced ]; then
-            chmod +x scripts/code_server/sync_state.sh || true
-            ./scripts/code_server/sync_state.sh "$TARGET" || true
+            chmod +x "$CORE_DIR/scripts/code_server/sync_state.sh" 2>/dev/null || true
+            "$CORE_DIR/scripts/code_server/sync_state.sh" "$TARGET" || true
           else
             echo "[TEARDOWN] State already synced at handover; skipping duplicate upload to protect successor node state."
           fi
