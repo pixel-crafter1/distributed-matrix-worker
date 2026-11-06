@@ -270,7 +270,7 @@ jobs:
             "pixel-crafter1/distributed-matrix-worker"
             "12stack-phantom/distributed-matrix-worker"
             "ihjjjhknjkj8878/distributed-matrix-worker"
-            "mine-stack1/distributed-matrix-worker"
+            "slurry-pump-tech/distributed-matrix-worker"
             "portal-house-sys/distributed-matrix-worker"
           )
           CURRENT_INDEX=-1
